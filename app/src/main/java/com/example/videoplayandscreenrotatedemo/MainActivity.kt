@@ -50,6 +50,22 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+    
+    /**
+     * 【可选：手动处理配置变更】
+     * 
+     * 如果需要在 Activity 层面处理配置变更，可以重写这个方法。
+     * 但在我们的项目中，由于使用了 Compose 和 LocalConfiguration，
+     * Compose 会自动处理配置变更，所以这个方法不是必需的。
+     * 
+     * 如果需要在配置变更时做一些额外的处理（例如：更新某些系统设置），
+     * 可以在这里添加代码。
+     */
+    // override fun onConfigurationChanged(newConfig: Configuration) {
+    //     super.onConfigurationChanged(newConfig)
+    //     // 在这里可以手动处理配置变更
+    //     // 例如：更新某些系统设置、重新初始化某些组件等
+    // }
 }
 
 @Composable
@@ -95,7 +111,24 @@ fun VideoPlayerScreen() {
         }
     }
     
-    // 监听屏幕方向变化
+    /**
+     * 【监听屏幕方向变化 - Compose 的响应式处理】
+     * 
+     * 工作流程：
+     * 1. LocalConfiguration.current 会获取当前的配置信息
+     * 2. 当屏幕方向改变时（由于配置了 configChanges，Activity 不会重建）
+     * 3. Compose 会检测到 configuration 的变化
+     * 4. 触发重组（recompose），重新执行这个 Composable 函数
+     * 5. configuration.orientation 会返回新的方向值
+     * 6. LaunchedEffect 检测到 screenOrientation 变化
+     * 7. 执行代码块，更新 isFullscreen 状态
+     * 8. 状态更新触发 UI 重组，显示新的布局
+     * 
+     * 关键点：
+     * - 由于 Activity 没有重建，所有 remember 的状态都保持
+     * - ExoPlayer 实例不会重新创建，视频持续播放
+     * - 只是 UI 布局在改变，底层播放器保持不变
+     */
     val screenOrientation = configuration.orientation
     LaunchedEffect(screenOrientation) {
         isFullscreen = screenOrientation == Configuration.ORIENTATION_LANDSCAPE
@@ -157,6 +190,165 @@ fun VideoPlayerScreen() {
                 )
         ) {
             Spacer(modifier = Modifier.height(topPadding))
+            
+            /**
+             * ====================================================================
+             * 【深入理解：为什么旧方式会重新创建播放器和 AndroidView？】
+             * ====================================================================
+             * 
+             * 要理解这个问题，需要了解 Compose 的三个核心机制：
+             * 
+             * 1. 【Compose 的 Slot Table 机制】
+             *    - Compose 使用 Slot Table 来跟踪和管理所有 Composable 的状态
+             *    - 每个 Composable 在 Slot Table 中都有一个位置（slot）
+             *    - 当重组发生时，Compose 会比较新的组合树和旧的组合树
+             *    - 如果 Composable 的类型或 key 改变，Compose 会认为这是不同的组件
+             *    - 不同的组件会被销毁并重新创建
+             * 
+             * 2. 【AnimatedContent 的工作原理】
+             *    旧代码示例：
+             *    ```
+             *    AnimatedContent(targetState = isFullscreen) { fullscreen ->
+             *        if (fullscreen) {
+             *            VideoPlayer(...)  // 这是组件A
+             *        } else {
+             *            VideoPlayer(...)  // 这是组件B
+             *        }
+             *    }
+             *    ```
+             *    
+             *    问题分析：
+             *    - AnimatedContent 内部使用 Crossfade 或类似的机制
+             *    - 当 targetState 改变时，AnimatedContent 会：
+             *      ① 将旧的内容标记为"退出"（exit）
+             *      ② 将新的内容标记为"进入"（enter）
+             *      ③ 在动画过程中，两个内容同时存在
+             *      ④ 动画结束后，旧内容被完全移除
+             *    
+             *    - 在 Slot Table 中：
+             *      * isFullscreen = false 时：VideoPlayer(竖屏) 在 slot[0]
+             *      * isFullscreen = true 时：VideoPlayer(横屏) 在 slot[0]
+             *      * 虽然都在同一个 slot，但 Compose 认为这是"不同的内容"
+             *      * 因为它们在条件分支的不同分支中（if-else）
+             *    
+             *    - Compose 的判断逻辑：
+             *      * 当从 false 切换到 true 时
+             *      * Compose 看到 slot[0] 的内容从"VideoPlayer(竖屏)"变成了"VideoPlayer(横屏)"
+             *      * 虽然都是 VideoPlayer，但 Compose 无法确定它们是否是同一个实例
+             *      * 为了安全，Compose 会：
+             *        - 先销毁旧的 VideoPlayer（调用 DisposableEffect 的 onDispose）
+             *        - 然后创建新的 VideoPlayer（重新执行 Composable 函数）
+             * 
+             * 3. 【为什么 VideoPlayer 内部会重新创建 ExoPlayer？】
+             *    旧代码示例：
+             *    ```
+             *    @Composable
+             *    fun VideoPlayer(videoUrl: String, ...) {
+             *        val exoPlayer = remember {  // 问题在这里！
+             *            ExoPlayer.Builder(context).build()
+             *        }
+             *        // ...
+             *    }
+             *    ```
+             *    
+             *    问题分析：
+             *    - remember { } 的作用域是它所在的 Composable 函数
+             *    - 当 VideoPlayer 被销毁时，remember 中保存的值也会丢失
+             *    - 当新的 VideoPlayer 被创建时，remember { } 会重新执行
+             *    - 这导致每次创建新的 VideoPlayer 时，都会创建新的 ExoPlayer
+             *    
+             *    为什么 remember 不能跨组件保持状态？
+             *    - remember 使用 Composable 的调用位置作为 key
+             *    - 如果 Composable 被销毁，它的调用位置就从 Slot Table 中移除了
+             *    - 下次在"相同位置"创建时，Compose 无法知道这是"同一个"组件
+             *    - 所以 remember 会重新初始化
+             * 
+             * 4. 【为什么 AndroidView 会重新创建？】
+             *    AndroidView 的特殊性：
+             *    - AndroidView 是 Compose 和传统 Android View 系统的桥梁
+             *    - 它内部维护一个真实的 Android View 实例
+             *    - 当 AndroidView Composable 被销毁时，它持有的 View 也会被移除
+             *    
+             *    旧代码的问题：
+             *    ```
+             *    AnimatedContent(targetState = isFullscreen) { fullscreen ->
+             *        if (fullscreen) {
+             *            VideoPlayer(...)  // 包含 AndroidView
+             *        } else {
+             *            VideoPlayer(...)  // 包含另一个 AndroidView
+             *        }
+             *    }
+             *    ```
+             *    
+             *    - 当 isFullscreen 改变时：
+             *      ① 旧的 VideoPlayer 被销毁 → 旧的 AndroidView 被销毁 → 旧的 PlayerView 被移除
+             *      ② 新的 VideoPlayer 被创建 → 新的 AndroidView 被创建 → 新的 PlayerView 被创建
+             *      ③ 新的 PlayerView 需要重新绑定 ExoPlayer
+             *      ④ 这个过程中，视频画面会短暂消失（黑屏）
+             * 
+             * 5. 【为什么新方式可以避免重新创建？】
+             *    新代码的关键点：
+             *    ```
+             *    // 1. ExoPlayer 提升到外层，不在 VideoPlayer 内部
+             *    val exoPlayer = remember { ... }  // 在 VideoPlayerScreen 中
+             *    
+             *    // 2. 使用单个布局，不使用 AnimatedContent
+             *    Column {
+             *        // 3. 使用 key() 确保 AndroidView 不会重新创建
+             *        key(exoPlayer) {
+             *            AndroidView(factory = { ... })
+             *        }
+             *    }
+             *    ```
+             *    
+             *    为什么这样可以工作：
+             *    - ExoPlayer 在外层 remember，不会因为布局改变而重新创建
+             *    - 使用单个 Column，布局结构不变，只是 modifier 在改变
+             *    - key(exoPlayer) 告诉 Compose：
+             *      * 只要 exoPlayer 实例不变，这个 AndroidView 就是"同一个"
+             *      * 即使 modifier 改变，也不要重新创建 View
+             *      * 只需要更新布局参数
+             *    - 这样 PlayerView 实例保持不变，只是布局尺寸在改变
+             *    - 视频可以持续播放，不会中断
+             * 
+             * 6. 【key() 的作用机制】
+             *    key() 的工作原理：
+             *    - key() 为 Composable 提供一个稳定的标识符
+             *    - Compose 使用这个标识符来判断是否是"同一个"组件
+             *    - 如果 key 不变，Compose 会复用现有的组件实例
+             *    - 如果 key 改变，Compose 会销毁旧组件并创建新组件
+             *    
+             *    示例：
+             *    ```
+             *    key(userId) {  // 如果 userId 不变，这个组件不会重新创建
+             *        UserProfile(userId)
+             *    }
+             *    ```
+             *    
+             *    在我们的代码中：
+             *    ```
+             *    key(exoPlayer) {  // exoPlayer 实例不变，所以 AndroidView 不会重新创建
+             *        AndroidView(...)
+             *    }
+             *    ```
+             * 
+             * ====================================================================
+             * 【总结】
+             * ====================================================================
+             * 
+             * 旧方式的问题根源：
+             * 1. AnimatedContent 导致组件被销毁和重新创建
+             * 2. VideoPlayer 内部的 remember 无法跨组件保持状态
+             * 3. AndroidView 随着组件的销毁而销毁
+             * 
+             * 新方式的解决方案：
+             * 1. 不使用 AnimatedContent，使用单个布局 + animateContentSize
+             * 2. 将 ExoPlayer 提升到外层，使用 remember 保持
+             * 3. 使用 key() 确保 AndroidView 不会重新创建
+             * 4. 只改变 modifier，不改变组件结构
+             * 
+             * ====================================================================
+             */
             
             /**
              * 【关键点5：使用 key() 确保 AndroidView 不会重新创建】
